@@ -43,7 +43,7 @@ python scripts/incident_simulator.py kupiec-breach
 python scripts/incident_simulator.py sequence-gap
 ```
 
-## SLO budget (signed off by Risk, 2024-01-15)
+## SLO budget 
 
 | Task             | Budget |
 |------------------|--------|
