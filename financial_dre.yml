@@ -1,0 +1,72 @@
+groups:
+  - name: financial_dre
+    interval: 10s
+    rules:
+
+      - alert: MicroStallDetected
+        expr: rate(micro_stall_events_total[1m]) > 0.1
+        for: 30s
+        labels:
+          severity: critical
+          team: quant-risk
+        annotations:
+          summary: "Micro-stall rate exceeds threshold"
+          description: "{{ $value | humanize }} stalls/sec. VaR data may be stale."
+
+      - alert: KafkaConsumerLagHigh
+        expr: sum(kafka_consumer_lag_messages) > 50000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer lag {{ $value }} messages"
+
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_open == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN — pipeline halted"
+
+      - alert: VaRSLOBreach
+        expr: var_pipeline_slo_drift_s > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "VaR pipeline SLO drifting {{ $value }}s"
+
+      - alert: TradeE2ELatencyHigh
+        expr: histogram_quantile(0.999, rate(trade_e2e_latency_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "P99.9 E2E latency {{ $value }}s exceeds 1s"
+
+      - alert: PostgresRowLockContention
+        expr: rate(ebpf_postgres_row_lock_events_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres row lock rate {{ $value | humanize }}/s"
+
+      - alert: MongoPageFaultSpike
+        expr: rate(ebpf_mongo_page_fault_events_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoDB page fault rate {{ $value | humanize }}/s"
+
+      - alert: KupiecModelRejection
+        expr: var_kupiec_pvalue < 0.05
+        for: 0s
+        labels:
+          severity: critical
+          team: quant-risk
+        annotations:
+          summary: "VaR model rejected by Kupiec test (p={{ $value | humanize }})"
+          description: "Escalate to Risk team immediately."

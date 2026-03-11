@@ -1,0 +1,219 @@
+version: "3.9"
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+  AIRFLOW__CORE__FERNET_KEY: ""
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_USER: dre_user
+  CLICKHOUSE_PASS: dre_pass
+  POSTGRES_CONN: host=postgres port=5432 dbname=financial_dre user=dre_user password=dre_pass
+  BOOK_ID: desk-1
+
+services:
+
+  # ── Data stores ────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dre_user
+      POSTGRES_PASSWORD: dre_pass
+      POSTGRES_DB: financial_dre
+    volumes:
+      - ./storage/init_postgres.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dre_user -d financial_dre"]
+      interval: 5s
+      retries: 10
+
+  postgres-airflow:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: dre_user
+      MONGO_INITDB_ROOT_PASSWORD: dre_pass
+    volumes:
+      - ./storage/init_mongo.js:/docker-entrypoint-initdb.d/01_init.js
+    ports:
+      - "27017:27017"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    environment:
+      CLICKHOUSE_USER: dre_user
+      CLICKHOUSE_PASSWORD: dre_pass
+      CLICKHOUSE_DB: financial_dre
+    volumes:
+      - ./storage/init_clickhouse.sql:/docker-entrypoint-initdb.d/01_init.sql
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  # ── Kafka ──────────────────────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on: [kafka]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8080:8080"
+
+  # ── Airflow ────────────────────────────────────────────────────────────────
+
+  airflow-init:
+    image: apache/airflow:2.9.1-python3.11
+    depends_on: [postgres-airflow]
+    environment: *airflow-env
+    entrypoint: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+          --firstname Admin --lastname User --role Admin --email admin@local
+      "
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1-python3.11
+    depends_on: [airflow-init]
+    environment: *airflow-env
+    volumes:
+      - ./pipeline:/opt/airflow/dags
+      - ./core:/opt/airflow/core
+    ports:
+      - "8088:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      retries: 10
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1-python3.11
+    depends_on: [airflow-webserver]
+    environment: *airflow-env
+    volumes:
+      - ./pipeline:/opt/airflow/dags
+      - ./core:/opt/airflow/core
+    command: scheduler
+
+  # ── FIX producer ──────────────────────────────────────────────────────────
+
+  fix-producer:
+    build: ./producer
+    depends_on: [kafka, clickhouse]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: fix-executions
+      TARGET_RATE_PER_MIN: "50000"
+      BOOK_ID: desk-1
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: dre_user
+      CLICKHOUSE_PASS: dre_pass
+    ports:
+      - "8001:8001"
+
+  # ── Consumer ──────────────────────────────────────────────────────────────
+
+  consumer:
+    build: ./consumer
+    depends_on: [kafka, clickhouse, postgres, redis]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: fix-executions
+      KAFKA_GROUP: dre-consumer
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: dre_user
+      CLICKHOUSE_PASS: dre_pass
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8002:8002"
+
+  # ── eBPF probe ─────────────────────────────────────────────────────────────
+
+  ebpf-probe:
+    build: ./ebpf
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+    ports:
+      - "8004:8004"
+
+  # ── Observability ──────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/rules:/etc/prometheus/rules
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+
+  pushgateway:
+    image: prom/pushgateway:v1.8.0
+    ports:
+      - "9091:9091"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: dre_admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
